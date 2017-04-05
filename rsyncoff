@@ -1,0 +1,456 @@
+#!/usr/bin/env python
+
+import sys, optparse, gzip, os, cPickle, shutil, stat
+
+DEBUG = 1
+INFO = 2
+WARN = 3
+ERROR = 4
+FATAL = 5
+
+SIGNATURE_FILE = 'source_signature.sig'
+
+class FileInfo:
+    def __init__(self, st_size, st_mtime, st_uid, st_gid, st_mode):
+        self.size = st_size
+        self.mtime = st_mtime
+        self.uid = st_uid
+        self.gid = st_gid
+        self.mode = st_mode
+        
+    def __str__(self):
+        s = '[size=%s, mtime=%s, uid=%s, gid=%s, mode=%s]' % (self.size, self.mtime, self.uid, self.gid, self.mode)
+        return s
+    
+    def __repr__(self):
+        return self.__str__()
+
+class RsyncOff:
+    
+    def __init__(self):
+        pass
+    
+    def execute_command(self):
+        if self.command == 'signature':
+            self.signature()
+        elif self.command == 'delta':
+            self.delta()
+        elif self.command == 'patch':
+            self.patch()
+        elif self.command == 'show':
+            self.show()
+        else:
+            self.error_message('Unknown command: %s.' % self.command)
+            
+    def signature(self):
+        self.log(INFO, 'building signature file.')
+        signature = self.walk_dir(self.target_dir, self.target_dir)
+        self._save_signature(signature, self.signature_file)
+        self.log(INFO, 'processed %s files.' % len(signature.keys()))
+        
+    def delta(self):
+        self.log(INFO, 'loading signature file.')
+        target_signature = self._load_signature(self.signature_file)
+        
+        self.log(INFO, 'building delta.')
+        source_signature = self.walk_dir(self.source_dir, self.source_dir)
+        sigfile = os.path.join(self.delta_dir, SIGNATURE_FILE)
+        self._save_signature(source_signature, sigfile)
+        
+        keys = source_signature.keys()
+        keys.sort()
+        for fk in keys:
+            sfi = source_signature[fk]
+            try:
+                tfi = target_signature[fk]
+            except KeyError:
+                tfi = None
+            if (not tfi) or (tfi.size != sfi.size) or (tfi.mtime != sfi.mtime):
+                sfile = os.path.join(self.source_dir, fk)
+                dfile = os.path.join(self.delta_dir, fk)
+                self.log(INFO, 'copying %s' % fk)
+                self._copy(sfile, dfile)
+                
+        if not self.dry_run:
+            delta_signature = self.walk_dir(self.delta_dir, self.delta_dir)
+            keys = delta_signature.keys()
+            keys.sort()
+            for fk in keys:
+                dfile = os.path.join(self.delta_dir, fk)
+                if os.path.isdir(dfile):
+                    dfi = delta_signature[fk]
+                    sfi = source_signature[fk]
+                    if (dfi.mtime != sfi.mtime):
+                        sfile = os.path.join(self.source_dir, fk)
+                        shutil.copystat(sfile, dfile)
+        
+                        
+    def patch(self):
+        sigfile = os.path.join(self.delta_dir, SIGNATURE_FILE)
+        if not os.path.isfile(sigfile):
+            self.error_message('not a valid delta_dir: %s.' % (self.delta_dir))
+        source_signature = self._load_signature(sigfile)
+        
+        target_signature = self.walk_dir(self.target_dir, self.target_dir)
+        delta_signature =  self.walk_dir(self.delta_dir, self.delta_dir)
+        
+        if self.delete_before:
+            self.delete_patch(source_signature, target_signature)
+        
+        dirs = []
+        keys = delta_signature.keys()
+        keys.sort()
+        for fk in keys:
+            if fk == SIGNATURE_FILE:
+                continue
+            dfile = os.path.join(self.delta_dir, fk)
+            tfile = os.path.join(self.target_dir, fk)
+            self.log(INFO, 'copying %s' % fk)
+            self._copy(dfile, tfile)
+            if os.path.isdir(dfile):
+                dirs.append((dfile, tfile))
+                
+        if not self.dry_run:
+            for (dfile, tfile) in dirs:            
+                shutil.copystat(dfile, tfile)
+         
+        if not self.keep_delta_dir and not self.dry_run:
+            shutil.rmtree(self.delta_dir)
+        
+        if self.delete_after:
+            self.delete_patch(source_signature, target_signature)
+            
+    def delete_patch(self, source_signature, target_signature):
+        keys = target_signature.keys()
+        keys.sort() 
+        for fk in keys:
+            try:
+                sfi = source_signature[fk]
+            except KeyError:
+                self.log(INFO, 'deleting %s' % fk)
+                tfile = os.path.join(self.target_dir, fk)
+                self._delete(tfile)
+                
+    def show(self):
+        self.log(INFO, 'loading signature file.')
+        signature = self._load_signature(self.signature_file)
+        
+        print('excluded: ', self.exclude)
+        print
+        
+        keys = signature.keys()
+        keys.sort()
+        for fk in keys:
+            print fk
+                
+    def walk_dir(self, working_dir, dir, signature = None):
+        # This is strange, but if I wrote signature = {}
+        # the subsequent calls of the method use the first signature instantiated 
+        if not signature:
+            signature = {}
+        
+        files = os.listdir(dir)
+        files.sort()
+        for f in files:
+            file = os.path.join(dir, f)
+            filekey = self._filekey(working_dir, file)
+            if filekey in self.exclude:
+                continue
+            self.examine_file(working_dir, file, signature)
+            if os.path.isdir(file):
+                if not os.path.islink(file): # Do not walk directory links
+                    self.walk_dir(working_dir, file, signature)
+
+        return signature
+                
+    def examine_file(self, working_dir, file, signature):
+        filekey = self._filekey(working_dir, file)
+        if os.path.exists(file):
+            st = os.stat(file)
+            fileinfo = FileInfo(st.st_size, st.st_mtime, st.st_uid, st.st_gid, st.st_mode)
+            if stat.S_ISDIR(st.st_mode):
+                # For directories the size is meaningless
+                fileinfo.size = 0
+            signature[filekey] = fileinfo
+        elif os.path.islink(file):
+            linkto = os.readlink(file)
+            fileinfo = FileInfo(0, 0, 0, 0, 0)
+            signature[filekey] = fileinfo
+        else:
+            raise Exception('Unkonk file type %s' % file)
+        
+    def _save_signature(self, signature, file):
+        if self.dry_run:
+            return
+        self.exclude = list(set(self.exclude))
+        f = gzip.open(file, 'wb')
+        data = (signature, self.exclude)
+        f.write(cPickle.dumps(data))
+        f.close()
+        
+    def _load_signature(self, file):
+        f = gzip.open(file, 'rb')
+        (signature, exclude) = cPickle.loads(f.read())
+        self.exclude.extend(exclude)
+        self.exclude = list(set(self.exclude))
+        f.close()
+        return signature
+    
+    def _copy(self, sfile, dfile):
+        if self.dry_run:
+            return
+        
+        # Check if parent directory exists
+        ddir, _ = os.path.split(dfile)
+        if not os.path.exists(ddir):
+            os.makedirs(ddir)
+        elif not os.path.isdir(ddir):
+            os.remove(ddir)
+            os.makedirs(ddir)
+            
+        # Check if destination file exists
+        bfile = None
+        if os.path.lexists(dfile):
+            if not (os.path.isdir(sfile) and os.path.isdir(dfile)):
+                bfile = self._get_backup_name(dfile)
+                shutil.move(dfile, bfile)
+        try:
+            if os.path.islink(sfile):
+                linkto = os.readlink(sfile)
+                os.symlink(linkto, dfile)
+            elif os.path.isfile(sfile):
+                shutil.copy2(sfile, dfile)
+            elif os.path.isdir(sfile):
+                if not os.path.exists(dfile):
+                    os.makedirs(dfile)
+                shutil.copystat(sfile, dfile)
+            else:
+                raise Exception('Unkonk file type %s' % sfile)
+        except:
+            if bfile:
+                shutil.move(bfile, dfile)
+            raise
+        
+        if bfile:
+            os.remove(bfile)
+            
+    def _delete(self, file):
+        if self.dry_run:
+            return
+        
+        if os.path.lexists(file):
+            if os.path.isdir(file):
+                shutil.rmtree(file)       
+            else:
+                os.remove(file)
+                
+    def _get_backup_name(self, file):
+        bfile = '%s.bak' % file
+        if not os.path.exists(bfile):
+            return bfile
+        for i in range(0, 100):
+            bfile = '%s.%s.bak' % (file, i)
+            if not os.path.exists(bfile):
+                return bfile
+        raise Exception('Backup file name not found.')
+            
+    def _filekey(self, working_dir, file):
+        l = len(working_dir) + 1
+        filekey = file[l:]
+        return filekey
+            
+    def error_message(self, message=None):
+        if self.parser:
+            self.parser.print_usage(sys.stderr)
+        if message:
+            sys.stderr.write('%s: error: %s' % (self.prog, message))
+            sys.stderr.write('\n')
+        sys.exit(2)
+        
+    def log(self, level, message):
+        if level==INFO: 
+            if self.verbose:
+                sys.stdout.write('%s\n' % message)
+        else:
+            raise Exception('Not implemented yet\n')
+    
+    def parse_cmdline_options(self):
+        """Parse argument list"""
+        
+        def dir_value(dir):
+            if dir.startswith('/'):
+                return os.path.normpath(dir)
+            elif dir.startswith('~'):
+                return dir_value(os.path.expanduser(dir))
+            else:
+                return dir_value(os.path.join(os.getcwd(), dir))
+            
+        def file_value(file, name):
+            if file.startswith('/'):
+                file = os.path.normpath(file)
+                dir, _ = os.path.split(file)
+                if os.path.isdir(dir):
+                    return file
+                else:
+                    self.error_message('wrong %s name: %s.' % (name, file))
+            elif file.startswith('~'):
+                return file_value(os.path.expanduser(file), name)
+            else:
+                return file_value(os.path.join(os.getcwd(), file), name)
+            
+        def check_dir_exists(dir, name):
+            if not os.path.exists(dir):
+                self.error_message('%s %s doesn\'t exist.' % (name, dir))
+                sys.exit(2)
+            if not os.path.isdir(dir):
+                self.error_message('%s %s is not a directory.' % (name, dir))
+                sys.exit(2)
+                
+        def check_file_exists(file, name):
+            if not os.path.exists(file):
+                self.error_message('%s %s doesn\'t exist.' % (name, file))
+                sys.exit(2)
+            if not os.path.isfile(file):
+                self.error_message('%s %s is not a file.' % (name, file))
+                sys.exit(2)
+            
+        def prompt_for_overwrite(file):
+            if self.force_overwrite or self.assume_yes:
+                return
+            if os.path.exists(file):
+                while True:
+                    answer = raw_input('%s already exists. overwrite ? [Y/n] ' % file)
+                    answer = answer.upper().strip()
+                    if answer == '' or answer == 'YES' or answer == 'Y':
+                        return
+                    elif answer == 'NO' or answer == 'N':
+                        #return False
+                        sys.exit(0)
+            else:
+                pass # simply exit
+            
+        def prompt_for_create_or_clean(dir, name):
+            if not os.path.exists(dir):
+                parent, _ = os.path.split(dir)
+                if not os.path.exists(parent):
+                    self.error_message('%s %s is not a valid path.' % (name, dir))
+                    sys.exit(2)
+                else:
+                    while True:
+                        if self.assume_yes:
+                            answer = 'Y'
+                        else:
+                            answer = raw_input('create a new directory %s ? [Y/n] ' % dir)
+                            answer = answer.upper().strip()
+                        if answer == '' or answer == 'YES' or answer == 'Y':
+                            if not self.dry_run:
+                                os.makedirs(dir)
+                            return
+                        elif answer == 'NO' or answer == 'N':
+                            sys.exit(0)
+            if not os.path.isdir(dir):
+                self.error_message('%s %s is not a directory.' % (name, dir))
+                sys.exit(2)
+            if len(os.listdir(dir)) > 0:
+                while True:
+                    if self.assume_yes:
+                        answer = 'Y'
+                    else:
+                        answer = raw_input('%s directory %s is not empty. clean it ? [Y/n] ' % (name, dir))
+                        answer = answer.upper().strip()
+                    if answer == '' or answer == 'YES' or answer == 'Y':
+                        if not self.dry_run:
+                            shutil.rmtree(dir)
+                            os.makedirs(dir)
+                        return
+                    elif answer == 'NO' or answer == 'N':
+                        pass
+            
+        usage = """usage: 
+        %prog [options] sig[nature] target_dir signature_file
+        %prog [options] delta signature_file source_dir delta_dir
+        %prog [options] patch target_dir delta_dir
+        %prog [options] show signature_file"""
+        
+        self.prog = 'rsyncoff'
+        self.parser = optparse.OptionParser(usage=usage, prog=self.prog)
+        
+        self.parser.add_option('-v', '--verbose',action='store_true', dest='verbose', help='Increase verbosity')
+        self.parser.add_option('-q', '--quiet', action='store_false', dest='verbose', help='Suppress non-error messages')
+        self.parser.add_option('-y', '--assume-yes', action='store_true', dest='assume_yes', help='When a yes/no prompt would be presented, assume that the user entered "yes"')
+        self.parser.add_option('-f', '--force-overwrite', action='store_true', dest='force_overwrite', help='Force overwriting of files')
+        self.parser.add_option('--del', '--delete', '--delete-before', action='store_true', dest='delete_before', help='This tells rsyncoff to delete extraneous files from the target dir')
+        self.parser.add_option('--delete-after', action='store_true', dest='delete_after', help='This tells rsyncoff to delete extraneous files from the target dir after the patching has completed')
+        self.parser.add_option('--keep-delta-dir', action='store_true', dest='keep_delta_dir', help='Keeps delta_dir after patching')
+        self.parser.add_option('-n', '--dry-run', action='store_true', dest='dry_run', help='This makes rsyncoff perform a trial run that doesn\'t make any changes (and produces mostly the same output as a real run)')
+        self.parser.add_option('--exclude', action='append', help='Exclude files matching')
+        
+        (options, args) = self.parser.parse_args()
+        
+        self.verbose = options.verbose
+        self.force_overwrite = options.force_overwrite 
+        self.assume_yes = options.assume_yes
+        self.delete_before = options.delete_before
+        self.delete_after = options.delete_after
+        if self.delete_after:
+            self.delete_before = False
+        self.keep_delta_dir = options.keep_delta_dir
+        self.dry_run = options.dry_run
+        self.exclude = options.exclude
+        if not self.exclude:
+            self.exclude = []
+        self.exclude = list(set(self.exclude))
+        
+        if len(args) < 1:
+            self.error_message()
+            
+        command = args.pop(0)
+        if not command in ['sig', 'signature', 'delta', 'patch', 'show']:
+            self.error_message('bad command %s.' % command)
+        if command == 'sig':
+            command = 'signature'
+        self.command = command
+        
+        if (command == 'signature' and len(args)<2) or \
+           (command == 'delta' and len(args)<3) or \
+           (command == 'patch' and len(args)<2) or \
+           (command == 'show' and len(args)<1):
+            self.error_message('too few arguments.')
+            
+        if command == 'signature':
+            self.target_dir = dir_value(args.pop(0))
+            check_dir_exists(self.target_dir, 'target_dir') 
+            self.signature_file = file_value(args.pop(0), 'signature_file')
+            prompt_for_overwrite(self.signature_file)
+            
+        if command == 'delta':
+            self.signature_file = file_value(args.pop(0), 'signature_file')
+            check_file_exists(self.signature_file, 'signature_file')
+            self.source_dir = dir_value(args.pop(0))
+            check_dir_exists(self.source_dir, 'source_dir') 
+            self.delta_dir = dir_value(args.pop(0))
+            prompt_for_create_or_clean(self.delta_dir, 'delta_dir')
+            
+        if command == 'patch':
+            self.target_dir = dir_value(args.pop(0))
+            check_dir_exists(self.target_dir, 'target_dir')
+            self.delta_dir = dir_value(args.pop(0))
+            check_dir_exists(self.delta_dir, 'delta_dir')
+            
+        if command == 'show':
+            self.signature_file = file_value(args.pop(0), 'signature_file')
+            check_file_exists(self.signature_file, 'signature_file')
+                
+        self.parser.destroy()
+        self.parser = None
+
+def main():
+    """Start here"""
+    os.stat_float_times(False)
+    rsyncoff = RsyncOff()
+    rsyncoff.parse_cmdline_options()
+    rsyncoff.execute_command()
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

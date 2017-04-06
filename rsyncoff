@@ -151,7 +151,7 @@ class RsyncOff:
         keys = signature.keys()
         keys.sort()
         for fk in keys:
-            print fk
+            print(fk)
 
     def walk_dir(self, working_dir, dirname, signature=None):
         # This is strange, but if I wrote signature = {}
@@ -229,7 +229,7 @@ class RsyncOff:
                 linkto = os.readlink(sfile)
                 try:
                     os.symlink(linkto, dfile)
-                except OSError, e:
+                except OSError as e:
                     if e.errno == errno.EEXIST:
                         os.remove(dfile)
                         os.symlink(linkto, dfile)

@@ -113,36 +113,44 @@ class RsyncOff:
         for fk in keys:
             if fk == SIGNATURE_FILE:
                 continue
-            dfile = os.path.join(self.delta_dir, fk)
-            tfile = os.path.join(self.target_dir, fk)
-            self.log(INFO, 'copying %s' % fk)
-            self._copy(dfile, tfile)
-            if os.path.isdir(dfile):
-                dirs.append((dfile, tfile))
+            try:
+                dfile = os.path.join(self.delta_dir, fk)
+                tfile = os.path.join(self.target_dir, fk)
+                self.log(INFO, 'copying %s' % fk)
+                self._copy(dfile, tfile)
+                if os.path.isdir(dfile):
+                    dirs.append((dfile, tfile))
+            except:
+                self.keep_delta_dir = True  # Force to keep delta_dir when an exception arises
+                import traceback
+                traceback.print_exc()
 
         if not self.dry_run:
             for (dfile, tfile) in dirs:
                 shutil.copystat(dfile, tfile)
 
-        if not self.keep_delta_dir and not self.dry_run:
-            shutil.rmtree(self.delta_dir)
-
         if self.delete_after:
             self.delete_patch(source_signature, target_signature)
+
+        if not self.keep_delta_dir and not self.dry_run:
+            shutil.rmtree(self.delta_dir)
 
     def delete_patch(self, source_signature, target_signature):
         keys = target_signature.keys()
         keys.sort()
         for fk in keys:
-            try:
-                sfi = source_signature[fk]
-            except KeyError:
-                self.log(INFO, 'deleting %s' % fk)
-                tfile = os.path.join(self.target_dir, fk)
-                self._delete(tfile)
+            if fk not in source_signature:
+                try:
+                    self.log(INFO, 'deleting %s' % fk)
+                    tfile = os.path.join(self.target_dir, fk)
+                    self._delete(tfile)
+                except:
+                    self.keep_delta_dir = True  # Force to keep delta_dir when an exception arises
+                    import traceback
+                    traceback.print_exc()
 
     def show(self):
-        self.log(INFO, 'loading signature file.')
+        self.log(INFO, 'Loading signature file.')
         signature = self._load_signature(self.signature_file)
 
         print('excluded: ', self.exclude)
@@ -242,7 +250,7 @@ class RsyncOff:
                     os.makedirs(dfile)
                 shutil.copystat(sfile, dfile)
             else:
-                raise Exception('Unkonk file type %s' % sfile)
+                raise Exception('Unknown file type %s' % sfile)
         except:
             if bfile:
                 shutil.move(bfile, dfile)
@@ -256,10 +264,14 @@ class RsyncOff:
             return
 
         if os.path.lexists(filename):
+            if os.path.islink(filename):
+                os.remove(filename)
             if os.path.isdir(filename):
                 shutil.rmtree(filename)
-            else:
+            if os.path.isfile(filename):
                 os.remove(filename)
+            else:
+                raise Exception('Unknown file type %s' % filename)
 
     def _get_backup_name(self, filename):
         bfile = '%s.bak' % file

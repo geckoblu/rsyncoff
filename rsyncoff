@@ -91,7 +91,7 @@ class RsyncOff:
                 if os.path.isdir(dfile):
                     dfi = delta_signature[fk]
                     sfi = source_signature[fk]
-                    if (dfi.mtime != sfi.mtime):
+                    if dfi.mtime != sfi.mtime:
                         sfile = os.path.join(self.source_dir, fk)
                         shutil.copystat(sfile, dfile)
 
@@ -195,7 +195,7 @@ class RsyncOff:
             fileinfo = FileInfo(0, 0, 0, 0, 0)
             signature[filekey] = fileinfo
         else:
-            raise Exception('Unknown file type %s' % file)
+            raise Exception('Unknown file type %s' % filename)
 
     def _save_signature(self, signature, filename):
         if self.dry_run:
@@ -274,7 +274,7 @@ class RsyncOff:
                 raise Exception('Unknown file type %s' % filename)
 
     def _get_backup_name(self, filename):
-        bfile = '%s.bak' % file
+        bfile = '%s.bak' % filename
         if not os.path.exists(bfile):
             return bfile
         for i in range(0, 100):
